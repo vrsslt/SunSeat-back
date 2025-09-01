@@ -6,7 +6,33 @@ import { sunScore } from "./src/services/sun.js";
 import { getCloudFraction } from "./src/services/meteo.js";
 
 const app = express();
-app.use(cors({ origin: "http://localhost:5173" }));
+// ✅ CORS propre: dev + prod (ton Vercel)
+const allowedOrigins = new Set([
+  "http://localhost:5173", // Vite dev
+  "http://localhost:4173", // Vite preview
+  "https://sun-seat-front.vercel.app", // 🔒 ton front prod
+]);
+
+// (optionnel) aussi via variable d'env si tu changes de domaine plus tard
+if (process.env.FRONT_URL) allowedOrigins.add(process.env.FRONT_URL);
+
+const corsOptions = {
+  origin(origin, cb) {
+    // Requêtes sans Origin (curl/healthchecks) -> OK
+    if (!origin) return cb(null, true);
+    return allowedOrigins.has(origin)
+      ? cb(null, true)
+      : cb(new Error(`Not allowed by CORS: ${origin}`));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: false, // passe à true si tu utilises des cookies
+};
+
+app.use(cors(corsOptions));
+// préflight
+app.options("*", cors(corsOptions));
+
 app.use(express.json());
 app.use(morgan("dev"));
 
