@@ -6,19 +6,19 @@ import { sunScore } from "./src/services/sun.js";
 import { getCloudFraction } from "./src/services/meteo.js";
 
 const app = express();
-// ✅ CORS propre: dev + prod (ton Vercel)
-const allowedOrigins = new Set([
-  "http://localhost:5173", // Vite dev
-  "http://localhost:4173", // Vite preview
-  "https://sun-seat-front.vercel.app", // 🔒 ton front prod
-]);
+// CORS propre: dev + prod
+import cors from "cors";
 
-// (optionnel) aussi via variable d'env si tu changes de domaine plus tard
+// ✅ ta whitelist avec ton Vercel
+const allowedOrigins = new Set([
+  "http://localhost:5173",
+  "http://localhost:4173",
+  "https://sun-seat-front.vercel.app", // ton front prod
+]);
 if (process.env.FRONT_URL) allowedOrigins.add(process.env.FRONT_URL);
 
 const corsOptions = {
   origin(origin, cb) {
-    // Requêtes sans Origin (curl/healthchecks) -> OK
     if (!origin) return cb(null, true);
     return allowedOrigins.has(origin)
       ? cb(null, true)
@@ -26,12 +26,17 @@ const corsOptions = {
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: false, // passe à true si tu utilises des cookies
+  credentials: false,
 };
 
+// Active CORS globalement (gère aussi OPTIONS)
 app.use(cors(corsOptions));
-// préflight
-app.options("*", cors(corsOptions));
+
+// ❌ supprime cette ligne si tu l’avais :
+// app.options("*", cors(corsOptions));
+
+// ✅ (optionnel) si tu veux vraiment une route OPTIONS explicite, utilise un pattern v6-compatible :
+app.options("/api/(.*)", cors(corsOptions)); // au lieu de "*"
 
 app.use(express.json());
 app.use(morgan("dev"));
