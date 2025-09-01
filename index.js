@@ -30,12 +30,6 @@ const corsOptions = {
 // Active CORS globalement (gère aussi OPTIONS)
 app.use(cors(corsOptions));
 
-// ❌ supprime cette ligne si tu l’avais :
-// app.options("*", cors(corsOptions));
-
-// ✅ (optionnel) si tu veux vraiment une route OPTIONS explicite, utilise un pattern v6-compatible :
-app.options("/api/(.*)", cors(corsOptions)); // au lieu de "*"
-
 app.use(express.json());
 app.use(morgan("dev"));
 
