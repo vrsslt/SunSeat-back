@@ -7,8 +7,6 @@ import { getCloudFraction } from "./src/services/meteo.js";
 
 const app = express();
 // CORS propre: dev + prod
-import cors from "cors";
-
 // ✅ ta whitelist avec ton Vercel
 const allowedOrigins = new Set([
   "http://localhost:5173",
