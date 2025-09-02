@@ -1,23 +1,28 @@
+// index.js
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
+import compression from "compression";
 import axios from "axios";
+
 import { sunScore } from "./src/services/sun.js";
 import { getCloudFraction } from "./src/services/meteo.js";
+import { getBuildings } from "./src/services/buildings.js";
+import { getSunAngles, isShadedByBuildings } from "./src/services/shade.js";
 
 const app = express();
-// CORS propre: dev + prod
-// ✅ ta whitelist avec ton Vercel
+
+/* ---------- CORS (dev + prod) ---------- */
 const allowedOrigins = new Set([
-  "http://localhost:5173",
-  "http://localhost:4173",
+  "http://localhost:5173", // Vite dev
+  "http://localhost:4173", // Vite preview
   "https://sun-seat-front.vercel.app", // ton front prod
 ]);
 if (process.env.FRONT_URL) allowedOrigins.add(process.env.FRONT_URL);
 
 const corsOptions = {
   origin(origin, cb) {
-    if (!origin) return cb(null, true);
+    if (!origin) return cb(null, true); // curl/healthchecks
     return allowedOrigins.has(origin)
       ? cb(null, true)
       : cb(new Error(`Not allowed by CORS: ${origin}`));
@@ -27,24 +32,39 @@ const corsOptions = {
   credentials: false,
 };
 
-// Active CORS globalement (gère aussi OPTIONS)
-app.use(cors(corsOptions));
+// Applique cors uniquement au namespace /api (suffisant et propre)
+app.use("/api", cors(corsOptions));
 
+/* ---------- Middlewares ---------- */
 app.use(express.json());
 app.use(morgan("dev"));
+app.use(compression());
 
-// Cache simple pour éviter de spammer Overpass API
+/* ---------- Cache simple ---------- */
 const cache = new Map();
-const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+const CACHE_DURATION = 5 * 60 * 1000; // 5 min
 
-app.get("/api/health", (req, res) => res.json({ ok: true }));
+/* ---------- Health ---------- */
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-// Fonction pour récupérer les bars/restaurants via Overpass API
+/* ---------- Util distance ---------- */
+function toRad(v) {
+  return (v * Math.PI) / 180;
+}
+function calculateDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+/* ---------- Overpass: bars/restos/cafés ---------- */
 async function getNearbyBarsAndRestaurants(lat, lon, radiusMeters = 1500) {
   const cacheKey = `${lat.toFixed(4)}_${lon.toFixed(4)}_${radiusMeters}`;
   const cached = cache.get(cacheKey);
-
-  // Vérifier le cache
   if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
     console.log("📦 Using cached data for", cacheKey);
     return cached.data;
@@ -62,9 +82,9 @@ async function getNearbyBarsAndRestaurants(lat, lon, radiusMeters = 1500) {
 
   try {
     console.log(
-      "🔍 Querying Overpass API for radius",
+      "🔍 Overpass amenities within",
       radiusMeters,
-      "around",
+      "m around",
       lat,
       lon
     );
@@ -73,68 +93,60 @@ async function getNearbyBarsAndRestaurants(lat, lon, radiusMeters = 1500) {
       "https://overpass-api.de/api/interpreter",
       overpassQuery,
       {
-        headers: { "Content-Type": "text/plain" },
+        headers: {
+          "Content-Type": "text/plain",
+          "User-Agent": "SunSeat/0.1 (contact: you@example.com)",
+        },
         timeout: 15000,
       }
     );
 
-    if (!response.data || !response.data.elements) {
+    const elements = response.data?.elements ?? [];
+    if (!elements.length) {
       console.warn("⚠️ No elements in Overpass response");
+      cache.set(cacheKey, { data: [], timestamp: Date.now() });
       return [];
     }
 
-    const places = response.data.elements
-      .filter((element) => {
-        const lat = element.lat || element.center?.lat;
-        const lon = element.lon || element.center?.lon;
-        return lat && lon; // Filtrer les éléments sans coordonnées
+    const places = elements
+      .filter((e) => {
+        const plat = e.lat || e.center?.lat;
+        const plon = e.lon || e.center?.lon;
+        return Number.isFinite(plat) && Number.isFinite(plon);
       })
-      .map((element) => {
-        // Calcul de distance approximative
-        const placeLat = element.lat || element.center?.lat;
-        const placeLon = element.lon || element.center?.lon;
+      .map((e) => {
+        const placeLat = e.lat || e.center?.lat;
+        const placeLon = e.lon || e.center?.lon;
         const distance = calculateDistance(lat, lon, placeLat, placeLon);
+        const orientationDeg = (e.id * 37) % 360;
 
-        // Estimation d'orientation basée sur l'ID (déterministe mais arbitraire)
-        const orientationDeg = (element.id * 37) % 360;
-
-        // Estimation de largeur de rue basée sur le type
         let streetWidth = "medium";
-        if (element.tags?.amenity === "biergarten") streetWidth = "wide";
-        if (element.tags?.amenity === "cafe") streetWidth = "narrow";
+        if (e.tags?.amenity === "biergarten") streetWidth = "wide";
+        if (e.tags?.amenity === "cafe") streetWidth = "narrow";
 
         return {
-          id: element.id,
-          name: element.tags?.name || element.tags?.brand || "Bar sans nom",
+          id: e.id,
+          name: e.tags?.name || e.tags?.brand || "Bar sans nom",
           lat: placeLat,
           lon: placeLon,
-          amenity: element.tags?.amenity,
-          outdoor_seating: element.tags?.outdoor_seating,
+          amenity: e.tags?.amenity,
+          outdoor_seating: e.tags?.outdoor_seating,
           orientationDeg,
           streetWidth,
           distance_m: Math.round(distance),
-          // Ajouter quelques infos utiles
-          cuisine: element.tags?.cuisine,
-          opening_hours: element.tags?.opening_hours,
-          website: element.tags?.website,
-          phone: element.tags?.phone,
+          cuisine: e.tags?.cuisine,
+          opening_hours: e.tags?.opening_hours,
+          website: e.tags?.website,
+          phone: e.tags?.phone,
         };
       })
-      .sort((a, b) => a.distance_m - b.distance_m); // Trier par distance
+      .sort((a, b) => a.distance_m - b.distance_m);
 
-    console.log(`✅ Found ${places.length} places from Overpass API`);
-
-    // Mettre en cache
-    cache.set(cacheKey, {
-      data: places,
-      timestamp: Date.now(),
-    });
-
+    console.log(`✅ Found ${places.length} places`);
+    cache.set(cacheKey, { data: places, timestamp: Date.now() });
     return places;
-  } catch (error) {
-    console.error("❌ Overpass API error:", error.message);
-
-    // En cas d'erreur, retourner quelques données de démonstration
+  } catch (err) {
+    console.error("❌ Overpass amenities error:", err.message);
     console.log("🔄 Falling back to demo data");
     return [
       {
@@ -161,159 +173,159 @@ async function getNearbyBarsAndRestaurants(lat, lon, radiusMeters = 1500) {
   }
 }
 
-// Fonction utilitaire pour calculer la distance (Haversine)
-function calculateDistance(lat1, lon1, lat2, lon2) {
-  const R = 6371000; // Rayon de la Terre en mètres
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) *
-      Math.cos(toRad(lat2)) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-}
-
-function toRad(value) {
-  return (value * Math.PI) / 180;
-}
-
+/* ---------- Route principale ---------- */
 // GET /api/terraces/nearby?lat=...&lon=...&radius=1500&forecast=true
 app.get("/api/terraces/nearby", async (req, res) => {
   const lat = Number(req.query.lat);
   const lon = Number(req.query.lon);
-  const radius = Number(req.query.radius || 1500);
+  // garde-fous sur radius
+  const radius = Math.min(
+    Math.max(Number(req.query.radius || 1500), 100),
+    3000
+  );
   const forecast = String(req.query.forecast || "false") === "true";
   const useDemo = String(req.query.demo || "false") === "true";
 
-  if (Number.isNaN(lat) || Number.isNaN(lon)) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
     return res
       .status(400)
       .json({ error: "bad_params", message: "lat and lon are required" });
   }
 
-  console.log(`🔍 Looking for places around ${lat}, ${lon} within ${radius}m`);
+  console.log(`🔍 Nearby @ ${lat}, ${lon} r=${radius}m forecast=${forecast}`);
 
   try {
-    // Récupérer les données météo
+    // météo (fraction nuageuse) — ta fonction le gère déjà
     const cloudFraction = await getCloudFraction(lat, lon).catch(() => {
-      console.warn("⚠️ Could not get cloud fraction, using default");
-      return 0.3; // valeur par défaut
+      console.warn("⚠️ Could not get cloud fraction, using default 0.3");
+      return 0.3;
     });
 
-    // Récupérer les lieux depuis Overpass API (ou données de démo si demandé)
+    // lieux
     const places = useDemo
-      ? [] // Force l'utilisation des vraies données
+      ? []
       : await getNearbyBarsAndRestaurants(lat, lon, radius);
-
     if (places.length === 0 && !useDemo) {
-      console.log(
-        "⚠️ No places found, you can try with ?demo=true for test data"
-      );
+      console.log("⚠️ No places found (try ?demo=true for test data)");
     }
+
+    // bâtiments autour du centre (suffit : 150–200m)
+    const buildings = await getBuildings(lat, lon, Math.min(radius, 200)).catch(
+      () => []
+    );
 
     const now = new Date();
 
-    // Calculer le score solaire pour chaque lieu
-    const items = places.map((place) => {
+    const items = places.map((p) => {
       const base = {
-        id: place.id,
-        name: place.name,
-        lat: place.lat,
-        lon: place.lon,
-        orientationDeg: place.orientationDeg,
-        streetWidth: place.streetWidth,
-        distance_m: place.distance_m,
-        amenity: place.amenity,
-        // Infos supplémentaires
-        cuisine: place.cuisine,
-        opening_hours: place.opening_hours,
-        outdoor_seating: place.outdoor_seating,
+        id: p.id,
+        name: p.name,
+        lat: p.lat,
+        lon: p.lon,
+        orientationDeg: p.orientationDeg,
+        streetWidth: p.streetWidth,
+        distance_m: p.distance_m,
+        amenity: p.amenity,
+        cuisine: p.cuisine,
+        opening_hours: p.opening_hours,
+        outdoor_seating: p.outdoor_seating,
       };
 
-      const score = sunScore({
-        lat: place.lat,
-        lon: place.lon,
-        orientationDeg: place.orientationDeg,
-        streetWidth: place.streetWidth,
+      // score brut (inclut déjà cloudFraction)
+      const scoreRaw = sunScore({
+        lat: p.lat,
+        lon: p.lon,
+        orientationDeg: p.orientationDeg,
+        streetWidth: p.streetWidth,
         date: now,
         cloudFraction,
       });
 
+      // ombre (maintenant)
+      const sunNow = getSunAngles(now, p.lat, p.lon);
+      const shade = isShadedByBuildings(
+        { lat: p.lat, lon: p.lon },
+        sunNow,
+        buildings,
+        { maxDist: 80, azTolerance: 25 }
+      );
+      const shadeFactor = shade.shaded
+        ? 0.4 - 0.2 * (shade.confidence || 0)
+        : 1;
+      const score = Math.max(
+        0,
+        Math.min(100, Math.round(scoreRaw * shadeFactor))
+      );
+
       const out = { ...base, sunScore: score };
 
-      // Ajouter les prévisions si demandées
+      // forecast (recalcule angles solaires, réutilise la même géométrie de bâtiments)
       if (forecast) {
         out.forecast = [0, 15, 30, 45, 60, 90, 120].map((min) => {
           const d = new Date(now.getTime() + min * 60000);
-          return {
-            tmin: min,
-            score: sunScore({
-              lat: place.lat,
-              lon: place.lon,
-              orientationDeg: place.orientationDeg,
-              streetWidth: place.streetWidth,
-              date: d,
-              cloudFraction,
-            }),
-          };
+          const raw = sunScore({
+            lat: p.lat,
+            lon: p.lon,
+            orientationDeg: p.orientationDeg,
+            streetWidth: p.streetWidth,
+            date: d,
+            cloudFraction,
+          });
+          const sunT = getSunAngles(d, p.lat, p.lon);
+          const shadeT = isShadedByBuildings(
+            { lat: p.lat, lon: p.lon },
+            sunT,
+            buildings,
+            { maxDist: 80, azTolerance: 25 }
+          );
+          const factorT = shadeT.shaded
+            ? 0.4 - 0.2 * (shadeT.confidence || 0)
+            : 1;
+          const final = Math.max(0, Math.min(100, Math.round(raw * factorT)));
+          return { tmin: min, score: final };
         });
       }
 
       return out;
     });
 
-    // Trier par score solaire décroissant
-    const sortedItems = items.sort((a, b) => b.sunScore - a.sunScore);
-
-    console.log(`✅ Returning ${sortedItems.length} places with sun scores`);
-
-    res.json(sortedItems);
+    const sorted = items.sort((a, b) => b.sunScore - a.sunScore);
+    console.log(`✅ Returning ${sorted.length} places with shade-aware scores`);
+    res.json(sorted);
   } catch (error) {
     console.error("❌ Error in /api/terraces/nearby:", error);
     res.status(500).json({
       error: "internal_error",
       message: error.message,
-      // En cas d'erreur serveur, on peut quand même renvoyer des données de test
       fallback: "Try adding ?demo=true to get test data",
     });
   }
 });
 
-// GET /api/terraces/:id/sunscore - garder l'endpoint existant pour la compatibilité
-app.get("/api/terraces/:id/sunscore", async (req, res) => {
-  const id = Number(req.params.id);
-
-  // Pour l'instant, cet endpoint ne fonctionne qu'avec les données de démo
-  // Tu pourrais l'améliorer pour faire une nouvelle requête Overpass pour un lieu spécifique
-
+/* ---------- Endpoint legacy (non implémenté) ---------- */
+app.get("/api/terraces/:id/sunscore", (_req, res) => {
   res.status(501).json({
     error: "not_implemented",
-    message:
-      "This endpoint needs to be updated to work with dynamic data from Overpass API",
+    message: "This endpoint needs an Overpass fetch for a specific place",
   });
 });
 
-// Nettoyage du cache toutes les heures
+/* ---------- Nettoyage cache ---------- */
 setInterval(() => {
   const now = Date.now();
   for (const [key, value] of cache.entries()) {
     if (now - value.timestamp > CACHE_DURATION * 12) {
-      // Nettoie les entrées de plus d'1h
-      cache.delete(key);
+      cache.delete(key); // > 1h
     }
   }
   console.log(`🧹 Cache cleanup: ${cache.size} entries remaining`);
 }, 60 * 60 * 1000);
 
+/* ---------- Boot ---------- */
 const port = process.env.PORT || 5000;
 app.listen(port, () => {
+  console.log(`✅ API running on http://localhost:${port}`);
   console.log(
-    `✅ API with Overpass integration running on http://localhost:${port}`
-  );
-  console.log(
-    `📍 Try: http://localhost:${port}/api/terraces/nearby?lat=48.8566&lon=2.3522&radius=1000`
+    `📍 Try: http://localhost:${port}/api/terraces/nearby?lat=48.8566&lon=2.3522&radius=1000&forecast=true`
   );
 });
