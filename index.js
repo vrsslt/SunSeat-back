@@ -8,7 +8,7 @@ import axios from "axios";
 import { sunScore } from "./src/services/sun.js";
 import { getCloudFraction } from "./src/services/meteo.js";
 import { getBuildings } from "./src/services/buildings.js";
-import { getSunAngles, isShadedByBuildings } from "./src/services/shade.js";
+import { getSunAngles, isShadedByBuildings } from "./src/services/shades.js";
 
 const app = express();
 
