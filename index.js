@@ -11,7 +11,7 @@ const app = express();
 const allowedOrigins = new Set([
   "http://localhost:5173",
   "http://localhost:4173",
-  "https://sun-seat-front.vercel.app",
+  "https://sunseat.app",
 ]);
 if (process.env.FRONT_URL) allowedOrigins.add(process.env.FRONT_URL);
 
